@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>YVR South Runway Monitor</title>
+  <style>
+    :root {
+      --bg: #090d16;
+      --card-bg: #131a29;
+      --text: #f8fafc;
+      --muted: #8492a6;
+      --takeoff: #f59e0b;
+      --takeoff-bg: rgba(245, 158, 11, 0.15);
+      --landing: #10b981;
+      --landing-bg: rgba(16, 185, 129, 0.15);
+      --route-bg: #1c2638;
+    }
+    body {
+      margin: 0;
+      padding: 16px;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      display: flex;
+      justify-content: center;
+    }
+    .board {
+      width: 100%;
+      max-width: 650px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+    .header-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.8rem;
+      color: var(--muted);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      font-weight: 600;
+    }
+    .radar-pulse {
+      width: 8px;
+      height: 8px;
+      background: #10b981;
+      border-radius: 50%;
+      display: inline-block;
+      margin-right: 6px;
+      box-shadow: 0 0 10px #10b981;
+    }
+    .card {
+      background: var(--card-bg);
+      border-radius: 18px;
+      overflow: hidden;
+      border: 1px solid rgba(255,255,255,0.07);
+      box-shadow: 0 15px 35px rgba(0,0,0,0.5);
+    }
+    .state-banner {
+      padding: 12px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 1.05rem;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+    }
+    .state-takeoff { background: var(--takeoff-bg); color: var(--takeoff); border-bottom: 2px solid var(--takeoff); }
+    .state-landing { background: var(--landing-bg); color: var(--landing); border-bottom: 2px solid var(--landing); }
+    .state-level { background: rgba(148, 163, 184, 0.15); color: var(--muted); border-bottom: 2px solid var(--muted); }
+
+    /* Route Strip */
+    .route-bar {
+      background: var(--route-bg);
+      padding: 14px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid rgba(255,255,255,0.05);
+    }
+    .airport-node {
+      display: flex;
+      flex-direction: column;
+      max-width: 42%;
+    }
+    .airport-node.right { text-align: right; }
+    .airport-code {
+      font-size: 1.5rem;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+    }
+    .airport-city {
+      font-size: 0.8rem;
+      color: var(--muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .route-arrow {
+      color: var(--muted);
+      font-size: 1.2rem;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .photo-stage {
+      width: 100%;
+      height: 300px;
+      background: #020617;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      position: relative;
+    }
+    .photo-stage img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .flight-identity {
+      padding: 16px 20px 8px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .callsign-group {
+      display: flex;
+      flex-direction: column;
+    }
+    .callsign {
+      font-size: 1.8rem;
+      font-weight: 800;
+      letter-spacing: -0.02em;
+    }
+    .airline-name {
+      color: var(--muted);
+      font-size: 0.9rem;
+      font-weight: 500;
+    }
+    .logo-badge {
+      background: #ffffff;
+      padding: 4px 10px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 75px;
+      height: 34px;
+    }
+    .logo-badge img {
+      max-height: 28px;
+      max-width: 90px;
+      object-fit: contain;
+    }
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      padding: 10px 20px 20px;
+    }
+    .data-cell {
+      background: rgba(255,255,255,0.03);
+      padding: 10px 12px;
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+    }
+    .data-label {
+      font-size: 0.65rem;
+      text-transform: uppercase;
+      color: var(--muted);
+      font-weight: 600;
+      margin-bottom: 3px;
+    }
+    .data-val {
+      font-size: 1.05rem;
+      font-weight: 700;
+    }
+    .empty-state {
+      padding: 70px 20px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 1.05rem;
+    }
+  </style>
+</head>
+<body>
+
+<div class="board">
+  <div class="header-bar">
+    <div><span class="radar-pulse"></span> Richmond Skywatch (08R/26L)</div>
+    <div id="clock">Syncing...</div>
+  </div>
+
+  <div class="card" id="flight-card">
+    <div class="empty-state">Scanning airspace within 6 NM...</div>
+  </div>
+</div>
+
+<script>
+  // Richmond Coordinates & Airspace Ceiling
+  const LAT = 49.1700;
+  const LON = -123.1350;
+  const RADIUS = 6;         // Nautical miles
+  const ALT_CEILING = 4500;   // Feet
+
+  const AIRLINE_REGISTRY = {
+    ACA: { name: "Air Canada", iata: "AC" },
+    WJA: { name: "WestJet", iata: "WS" },
+    FLE: { name: "Flair Airlines", iata: "F8" },
+    JZA: { name: "Air Canada Express", iata: "QK" },
+    CJT: { name: "Cargojet", iata: "W8" },
+    PCO: { name: "Pacific Coastal", iata: "8P" },
+    FDX: { name: "FedEx", iata: "FX" },
+    UPS: { name: "UPS Airlines", iata: "5X" },
+    DAL: { name: "Delta Air Lines", iata: "DL" },
+    UAL: { name: "United Airlines", iata: "UA" },
+    AAL: { name: "American Airlines", iata: "AA" },
+    ASA: { name: "Alaska Airlines", iata: "AS" },
+    CPA: { name: "Cathay Pacific", iata: "CX" },
+    EVA: { name: "EVA Air", iata: "BR" },
+    CAL: { name: "China Airlines", iata: "CI" },
+    KAL: { name: "Korean Air", iata: "KE" },
+    AAR: { name: "Asiana Airlines", iata: "OZ" },
+    ANA: { name: "All Nippon Airways", iata: "NH" },
+    JAL: { name: "Japan Airlines", iata: "JL" },
+    BAW: { name: "British Airways", iata: "BA" },
+    DLH: { name: "Lufthansa", iata: "LH" },
+    AFR: { name: "Air France", iata: "AF" },
+    KLM: { name: "KLM", iata: "KL" },
+    ANZ: { name: "Air New Zealand", iata: "NZ" },
+    QFA: { name: "Qantas", iata: "QF" },
+    AMX: { name: "Aeroméxico", iata: "AM" },
+    TSC: { name: "Air Transat", iata: "TS" },
+    SWG: { name: "Sunwing Airlines", iata: "WG" },
+    CHH: { name: "Hainan Airlines", iata: "HU" },
+    CSN: { name: "China Southern", iata: "CZ" },
+    CES: { name: "China Eastern", iata: "MU" },
+    XMN: { name: "XiamenAir", iata: "MF" }
+  };
+
+  const photoStore = new Map();
+  const routeStore = new Map();
+
+  async function pollAirspace() {
+    try {
+      const res = await fetch(`https://api.airplanes.live/v2/point/${LAT}/${LON}/${RADIUS}`);
+      const data = await res.json();
+      document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+
+      if (!data.ac || data.ac.length === 0) {
+        showEmpty("No planes detected in corridor");
+        return;
+      }
+
+      const activePlanes = data.ac.filter(p => p.alt_baro && p.alt_baro <= ALT_CEILING);
+
+      if (activePlanes.length === 0) {
+        showEmpty("Corridor clear below 4,500 ft");
+        return;
+      }
+
+      // Prioritize the closest/lowest plane
+      const plane = activePlanes.sort((a, b) => a.alt_baro - b.alt_baro)[0];
+      const callsign = (plane.flight || plane.r || "").trim();
+
+      // Parallel lookups: Photo + Origin/Destination
+      const [photo, route] = await Promise.all([
+        fetchPhoto(plane.hex),
+        fetchRoute(callsign)
+      ]);
+
+      renderDisplay(plane, photo, route);
+    } catch (err) {
+      console.error(err);
+      document.getElementById('clock').textContent = "Offline";
+    }
+  }
+
+  // Lookup Origin and Destination via ADSBdb API
+  async function fetchRoute(callsign) {
+    if (!callsign) return null;
+    if (routeStore.has(callsign)) return routeStore.get(callsign);
+
+    try {
+      const res = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`);
+      if (!res.ok) {
+        routeStore.set(callsign, null);
+        return null;
+      }
+      const data = await res.json();
+      if (data?.response?.flightroute) {
+        const fr = data.response.flightroute;
+        const routeData = {
+          originCode: fr.origin?.iata_code || fr.origin?.icao_code || "DEP",
+          originCity: fr.origin?.municipality || fr.origin?.name || "Origin",
+          destCode: fr.destination?.iata_code || fr.destination?.icao_code || "ARR",
+          destCity: fr.destination?.municipality || fr.destination?.name || "Destination"
+        };
+        routeStore.set(callsign, routeData);
+        return routeData;
+      }
+    } catch (e) {
+      console.warn("Route fetch error:", e);
+    }
+    routeStore.set(callsign, null);
+    return null;
+  }
+
+  async function fetchPhoto(hex) {
+    if (photoStore.has(hex)) return photoStore.get(hex);
+    try {
+      const res = await fetch(`https://api.planespotters.net/pub/photos/hex/${hex}`);
+      const json = await res.json();
+      if (json.photos && json.photos.length > 0) {
+        const url = json.photos[0].thumbnail_large.src;
+        photoStore.set(hex, url);
+        return url;
+      }
+    } catch (e) {
+      console.warn("Photo lookup failed", e);
+    }
+    return null;
+  }
+
+  function renderDisplay(plane, photoUrl, route) {
+    const rawCallsign = (plane.flight || plane.r || "UNIDENTIFIED").trim();
+    const icaoPrefix = rawCallsign.slice(0, 3).toUpperCase();
+    const carrier = AIRLINE_REGISTRY[icaoPrefix] || { name: "General / Private", iata: null };
+
+    // Determine Landing vs Takeoff
+    const vRate = plane.baro_rate || 0;
+    let stateClass = "state-level";
+    let stateLabel = "✈️ LEVEL / EN ROUTE";
+    let stateRate = `${Math.abs(vRate)} ft/min`;
+
+    const isLanding = vRate <= -150;
+    const isTakeoff = vRate >= 150;
+
+    if (isLanding) {
+      stateClass = "state-landing";
+      stateLabel = "🛬 LANDING (APPROACH)";
+      stateRate = `▼ ${Math.abs(vRate).toLocaleString()} ft/min`;
+    } else if (isTakeoff) {
+      stateClass = "state-takeoff";
+      stateLabel = "🛫 TAKEOFF (DEPARTING)";
+      stateRate = `▲ +${vRate.toLocaleString()} ft/min`;
+    }
+
+    // Determine Route Display (Database match vs. Intelligent Fallback)
+    let originCode = "---", originCity = "Unknown";
+    let destCode = "---", destCity = "Unknown";
+
+    if (route) {
+      originCode = route.originCode;
+      originCity = route.originCity;
+      destCode = route.destCode;
+      destCity = route.destCity;
+    } else {
+      // If it's a private flight, cargo hop, or unfiled callsign, infer YVR direction
+      if (isLanding) {
+        originCode = "???"; originCity = "Inbound";
+        destCode = "YVR"; destCity = "Vancouver";
+      } else if (isTakeoff) {
+        originCode = "YVR"; originCity = "Vancouver";
+        destCode = "???"; destCity = "Outbound";
+      }
+    }
+
+    const logoHtml = carrier.iata 
+      ? `<div class="logo-badge">
+           <img src="https://pics.avs.io/200/80/${carrier.iata}.png" 
+                onerror="this.onerror=null; this.src='https://images.kiwi.com/airlines/64/${carrier.iata}.png';" 
+                alt="${carrier.name}">
+         </div>`
+      : ``;
+
+    const photoHtml = photoUrl
+      ? `<img src="${photoUrl}" alt="${rawCallsign}">`
+      : `<div style="color:var(--muted)">No photograph on file for ${plane.r || plane.hex}</div>`;
+
+    document.getElementById('flight-card').innerHTML = `
+      <div class="state-banner ${stateClass}">
+        <div>${stateLabel}</div>
+        <div>${stateRate}</div>
+      </div>
+
+      <div class="route-bar">
+        <div class="airport-node">
+          <span class="airport-code">${originCode}</span>
+          <span class="airport-city">${originCity}</span>
+        </div>
+        <div class="route-arrow">✈ ➔</div>
+        <div class="airport-node right">
+          <span class="airport-code">${destCode}</span>
+          <span class="airport-city">${destCity}</span>
+        </div>
+      </div>
+
+      <div class="photo-stage">
+        ${photoHtml}
+      </div>
+
+      <div class="flight-identity">
+        <div class="callsign-group">
+          <span class="callsign">${rawCallsign}</span>
+          <span class="airline-name">${carrier.name}</span>
+        </div>
+        ${logoHtml}
+      </div>
+
+      <div class="telemetry-grid">
+        <div class="data-cell">
+          <span class="data-label">Aircraft Type</span>
+          <span class="data-val">${plane.t || "—"}</span>
+        </div>
+        <div class="data-cell">
+          <span class="data-label">Altitude</span>
+          <span class="data-val">${plane.alt_baro.toLocaleString()} ft</span>
+        </div>
+        <div class="data-cell">
+          <span class="data-label">Ground Speed</span>
+          <span class="data-val">${plane.gs ? Math.round(plane.gs) + " kts" : "—"}</span>
+        </div>
+        <div class="data-cell">
+          <span class="data-label">Registration</span>
+          <span class="data-val">${plane.r || plane.hex}</span>
+        </div>
+        <div class="data-cell">
+          <span class="data-label">Track / Heading</span>
+          <span class="data-val">${plane.track ? Math.round(plane.track) + "°" : "—"}</span>
+        </div>
+        <div class="data-cell">
+          <span class="data-label">Runway Vector</span>
+          <span class="data-val">${plane.track > 180 ? "08R Vector" : "26L Vector"}</span>
+        </div>
+      </div>
+    `;
+  }
+
+  function showEmpty(msg) {
+    document.getElementById('flight-card').innerHTML = `<div class="empty-state">${msg}</div>`;
+  }
+
+  pollAirspace();
+  setInterval(pollAirspace, 4000);
+</script>
+</body>
+</html>
