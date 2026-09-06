@@ -257,6 +257,12 @@
   const RADIUS = 8;         // Nautical miles
   const ALT_CEILING = 5000;   // Altitude ceiling in feet
 
+  // Approximate magnetic headings of YVR's south runway (08R/26L), used
+  // only to label which runway an aircraft is lined up with.
+  const RWY_08R_HEADING = 80;
+  const RWY_26L_HEADING = 260;
+  const RWY_HEADING_TOLERANCE = 35; // degrees either side counts as "lined up"
+
   const AIRLINE_REGISTRY = {
     ACA: { name: "Air Canada", iata: "AC" },
     WJA: { name: "WestJet", iata: "WS" },
@@ -294,6 +300,7 @@
 
   const photoStore = new Map();
   const routeStore = new Map();
+  let consecutiveFailures = 0;
 
   // Helper with strict timeout to prevent any hanging in mobile Safari
   async function fetchWithTimeout(url, timeoutMs = 3500) {
@@ -310,10 +317,26 @@
     }
   }
 
+  function isOnGround(altBaro) {
+    return typeof altBaro === "string" && altBaro.toLowerCase() === "ground";
+  }
+
+  // Great-circle distance in nautical miles between the station and an aircraft.
+  function distanceNm(lat1, lon1, lat2, lon2) {
+    const toRad = (deg) => (deg * Math.PI) / 180;
+    const R_NM = 3440.065; // Earth radius in nautical miles
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return 2 * R_NM * Math.asin(Math.sqrt(a));
+  }
+
   // Rotates across 3 community feeds
   async function fetchRadarFeed() {
     const providers = [
-      { name: "Airplanes.live", url: `https://api.airplanes.live/v2/point/${LAT}/${LON}/${RADIUS}` },
+      { name: "ADSB.one", url: `https://api.adsb.one/v2/point/${LAT}/${LON}/${RADIUS}` },
       { name: "ADSB.lol", url: `https://api.adsb.lol/v2/point/${LAT}/${LON}/${RADIUS}` },
       { name: "ADSB.fi", url: `https://opendata.adsb.fi/api/v2/lat/${LAT}/lon/${LON}/dist/${RADIUS}` }
     ];
@@ -337,6 +360,7 @@
 
     try {
       const data = await fetchRadarFeed();
+      consecutiveFailures = 0;
 
       if (!data.ac || data.ac.length === 0) {
         renderClearState("Corridor Clear", "No aircraft detected within 8 nautical miles.");
@@ -346,7 +370,7 @@
       // Filter traffic below altitude ceiling or on ground
       const activePlanes = data.ac.filter(p => {
         if (!p.alt_baro && p.alt_baro !== 0) return false;
-        if (typeof p.alt_baro === "string" && p.alt_baro.toLowerCase() === "ground") return true;
+        if (isOnGround(p.alt_baro)) return true;
         return typeof p.alt_baro === "number" && p.alt_baro <= ALT_CEILING;
       });
 
@@ -355,12 +379,20 @@
         return;
       }
 
-      // Target lowest/closest aircraft
-      const plane = activePlanes.sort((a, b) => {
-        const altA = a.alt_baro === "ground" ? 0 : Number(a.alt_baro) || 9999;
-        const altB = b.alt_baro === "ground" ? 0 : Number(b.alt_baro) || 9999;
-        return altA - altB;
-      })[0];
+      // Tag each candidate with its distance from the station, then target
+      // whichever aircraft is physically closest to the field — this is a
+      // better proxy for "the one worth looking at" than altitude alone,
+      // since a close-in aircraft on approach can be at a similar altitude
+      // to one still several miles out.
+      const withDistance = activePlanes.map(p => ({
+        plane: p,
+        distNm: (typeof p.lat === "number" && typeof p.lon === "number")
+          ? distanceNm(LAT, LON, p.lat, p.lon)
+          : Infinity
+      }));
+
+      withDistance.sort((a, b) => a.distNm - b.distNm);
+      const { plane, distNm } = withDistance[0];
 
       const callsign = (plane.flight || plane.r || "").trim();
 
@@ -369,8 +401,9 @@
         fetchRoute(callsign)
       ]);
 
-      renderDisplay(plane, photo, route);
+      renderDisplay(plane, photo, route, distNm);
     } catch (err) {
+      consecutiveFailures++;
       document.getElementById('feed-status').textContent = `Reconnecting radar stream... (${err.message})`;
     }
   }
@@ -423,7 +456,20 @@
     `;
   }
 
-  function renderDisplay(plane, photoUrl, route) {
+  // Angular difference between two compass headings, 0-180.
+  function headingDiff(a, b) {
+    const d = Math.abs(a - b) % 360;
+    return d > 180 ? 360 - d : d;
+  }
+
+  function runwayVectorLabel(track) {
+    if (typeof track !== "number") return "—";
+    if (headingDiff(track, RWY_08R_HEADING) <= RWY_HEADING_TOLERANCE) return "08R Vector";
+    if (headingDiff(track, RWY_26L_HEADING) <= RWY_HEADING_TOLERANCE) return "26L Vector";
+    return "Off-Axis";
+  }
+
+  function renderDisplay(plane, photoUrl, route, distNm) {
     const rawCallsign = (plane.flight || plane.r || "UNIDENTIFIED").trim();
     const icaoPrefix = rawCallsign.slice(0, 3).toUpperCase();
     const carrier = AIRLINE_REGISTRY[icaoPrefix] || { name: "General / Private", iata: null };
@@ -476,9 +522,11 @@
       ? `<img src="${photoUrl}" alt="${rawCallsign}">`
       : `<div style="color:var(--muted)">No photograph on file for ${plane.r || plane.hex}</div>`;
 
-    const altDisplay = (plane.alt_baro === "ground" || plane.alt_baro === 0)
+    const altDisplay = isOnGround(plane.alt_baro)
       ? "Tarmac / Ground"
-      : `${plane.alt_baro.toLocaleString()} ft`;
+      : (typeof plane.alt_baro === "number" ? `${plane.alt_baro.toLocaleString()} ft` : "—");
+
+    const distDisplay = Number.isFinite(distNm) ? `${distNm.toFixed(1)} nm` : "—";
 
     document.getElementById('flight-card').innerHTML = `
       <div class="state-banner ${stateClass}">
@@ -524,6 +572,10 @@
           <span class="data-val">${plane.gs ? Math.round(plane.gs) + " kts" : "—"}</span>
         </div>
         <div class="data-cell">
+          <span class="data-label">Distance</span>
+          <span class="data-val">${distDisplay}</span>
+        </div>
+        <div class="data-cell">
           <span class="data-label">Registration</span>
           <span class="data-val">${plane.r || plane.hex}</span>
         </div>
@@ -531,18 +583,23 @@
           <span class="data-label">Track / Heading</span>
           <span class="data-val">${plane.track ? Math.round(plane.track) + "°" : "—"}</span>
         </div>
-        <div class="data-cell">
+        <div class="data-cell" style="grid-column: span 3;">
           <span class="data-label">Runway Vector</span>
-          <span class="data-val">${plane.track > 180 ? "08R Vector" : "26L Vector"}</span>
+          <span class="data-val">${runwayVectorLabel(plane.track)}</span>
         </div>
       </div>
     `;
   }
 
-  // Self-scheduling loop: runs next poll only after current poll completes
+  // Self-scheduling loop: runs next poll only after current poll completes.
+  // Backs off after repeated failures so we don't hammer public feeds
+  // that are down or rate-limiting us.
   async function pollLoop() {
     await pollAirspace();
-    setTimeout(pollLoop, 4000);
+    const delay = consecutiveFailures > 0
+      ? Math.min(4000 * Math.pow(2, consecutiveFailures), 30000)
+      : 4000;
+    setTimeout(pollLoop, delay);
   }
 
   pollLoop();
