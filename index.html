@@ -318,19 +318,31 @@
 
   // Some public ADS-B feeds don't send the Access-Control-Allow-Origin
   // header browsers require for cross-site requests (they're mainly meant
-  // for curl/server use). When the direct call fails, retry once through a
-  // public CORS proxy that adds the missing header on the way back.
+  // for curl/server use). When the direct call fails, retry through a
+  // chain of independent public CORS proxies before giving up — using more
+  // than one means a single proxy tightening its policy doesn't take the
+  // whole widget down.
+  const CORS_PROXIES = [
+    (url) => `https://corsproxy.io/?url=${encodeURIComponent(url)}`,
+    (url) => `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`,
+    (url) => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(url)}`
+  ];
+
   async function fetchDirectOrProxied(url, timeoutMs = 3500) {
+    const attempts = [];
     try {
       return await fetchWithTimeout(url, timeoutMs);
-    } catch (directErr) {
-      const proxied = `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
+    } catch (err) {
+      attempts.push(`direct: ${err.message}`);
+    }
+    for (const buildProxyUrl of CORS_PROXIES) {
       try {
-        return await fetchWithTimeout(proxied, timeoutMs);
-      } catch (proxyErr) {
-        throw directErr; // surface the original, more informative error
+        return await fetchWithTimeout(buildProxyUrl(url), timeoutMs);
+      } catch (err) {
+        attempts.push(`proxy: ${err.message}`);
       }
     }
+    throw new Error(attempts[attempts.length - 1] || "All fetch attempts failed");
   }
 
   function isOnGround(altBaro) {
