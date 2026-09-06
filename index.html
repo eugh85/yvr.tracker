@@ -71,7 +71,6 @@
     .state-landing { background: var(--landing-bg); color: var(--landing); border-bottom: 2px solid var(--landing); }
     .state-level { background: rgba(148, 163, 184, 0.15); color: var(--muted); border-bottom: 2px solid var(--muted); }
 
-    /* Route Strip */
     .route-bar {
       background: var(--route-bg);
       padding: 14px 20px;
@@ -186,6 +185,11 @@
       color: var(--muted);
       font-size: 1.05rem;
     }
+    .err-text {
+      color: #ef4444;
+      font-size: 0.85rem;
+      margin-top: 10px;
+    }
   </style>
 </head>
 <body>
@@ -193,20 +197,19 @@
 <div class="board">
   <div class="header-bar">
     <div><span class="radar-pulse"></span> Richmond Skywatch (08R/26L)</div>
-    <div id="clock">Syncing...</div>
+    <div id="clock">Connecting...</div>
   </div>
 
   <div class="card" id="flight-card">
-    <div class="empty-state">Scanning airspace within 6 NM...</div>
+    <div class="empty-state">Connecting to radar stream...</div>
   </div>
 </div>
 
 <script>
-  // Richmond Coordinates & Airspace Ceiling
   const LAT = 49.1700;
   const LON = -123.1350;
-  const RADIUS = 6;         // Nautical miles
-  const ALT_CEILING = 4500;   // Feet
+  const RADIUS = 8;         // Expanded slightly to catch early lineups
+  const ALT_CEILING = 5000;   // Feet
 
   const AIRLINE_REGISTRY = {
     ACA: { name: "Air Canada", iata: "AC" },
@@ -246,29 +249,46 @@
   const photoStore = new Map();
   const routeStore = new Map();
 
+  async function fetchWithFallback(url) {
+    // 1. Try direct fetch first
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (res.ok) return await res.json();
+    } catch (e) {
+      console.warn("Direct fetch blocked, trying CORS proxy fallback...", e);
+    }
+
+    // 2. Fallback via reliable open proxy if browser/Cloudflare blocks direct
+    const proxyUrl = `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
+    const proxyRes = await fetch(proxyUrl);
+    if (!proxyRes.ok) throw new Error(`Proxy status: ${proxyRes.status}`);
+    return await proxyRes.json();
+  }
+
   async function pollAirspace() {
     try {
-      const res = await fetch(`https://api.airplanes.live/v2/point/${LAT}/${LON}/${RADIUS}`);
-      const data = await res.json();
+      const targetApi = `https://api.airplanes.live/v2/point/${LAT}/${LON}/${RADIUS}`;
+      const data = await fetchWithFallback(targetApi);
+
       document.getElementById('clock').textContent = new Date().toLocaleTimeString();
 
       if (!data.ac || data.ac.length === 0) {
-        showEmpty("No planes detected in corridor");
+        showEmpty("No planes currently detected in Richmond corridor");
         return;
       }
 
+      // Filter to traffic under ceiling
       const activePlanes = data.ac.filter(p => p.alt_baro && p.alt_baro <= ALT_CEILING);
 
       if (activePlanes.length === 0) {
-        showEmpty("Corridor clear below 4,500 ft");
+        showEmpty("Corridor clear below 5,000 ft");
         return;
       }
 
-      // Prioritize the closest/lowest plane
+      // Lowest plane is prioritized
       const plane = activePlanes.sort((a, b) => a.alt_baro - b.alt_baro)[0];
       const callsign = (plane.flight || plane.r || "").trim();
 
-      // Parallel lookups: Photo + Origin/Destination
       const [photo, route] = await Promise.all([
         fetchPhoto(plane.hex),
         fetchRoute(callsign)
@@ -278,10 +298,10 @@
     } catch (err) {
       console.error(err);
       document.getElementById('clock').textContent = "Offline";
+      showEmpty(`Unable to fetch live radar data.<div class="err-text">Error: ${err.message || err}</div>`);
     }
   }
 
-  // Lookup Origin and Destination via ADSBdb API
   async function fetchRoute(callsign) {
     if (!callsign) return null;
     if (routeStore.has(callsign)) return routeStore.get(callsign);
@@ -305,7 +325,7 @@
         return routeData;
       }
     } catch (e) {
-      console.warn("Route fetch error:", e);
+      // route lookup failed gracefully
     }
     routeStore.set(callsign, null);
     return null;
@@ -322,7 +342,7 @@
         return url;
       }
     } catch (e) {
-      console.warn("Photo lookup failed", e);
+      // photo lookup failed gracefully
     }
     return null;
   }
@@ -332,7 +352,6 @@
     const icaoPrefix = rawCallsign.slice(0, 3).toUpperCase();
     const carrier = AIRLINE_REGISTRY[icaoPrefix] || { name: "General / Private", iata: null };
 
-    // Determine Landing vs Takeoff
     const vRate = plane.baro_rate || 0;
     let stateClass = "state-level";
     let stateLabel = "✈️ LEVEL / EN ROUTE";
@@ -351,7 +370,6 @@
       stateRate = `▲ +${vRate.toLocaleString()} ft/min`;
     }
 
-    // Determine Route Display (Database match vs. Intelligent Fallback)
     let originCode = "---", originCity = "Unknown";
     let destCode = "---", destCity = "Unknown";
 
@@ -361,7 +379,6 @@
       destCode = route.destCode;
       destCity = route.destCity;
     } else {
-      // If it's a private flight, cargo hop, or unfiled callsign, infer YVR direction
       if (isLanding) {
         originCode = "???"; originCity = "Inbound";
         destCode = "YVR"; destCity = "Vancouver";
