@@ -180,7 +180,7 @@
       font-weight: 700;
     }
 
-    /* Idle Scanning UI */
+    /* Idle Radar Scanning State */
     .scan-screen {
       padding: 50px 20px;
       display: flex;
@@ -243,8 +243,8 @@
   <div class="card" id="flight-card">
     <div class="scan-screen">
       <div class="radar-sweep"></div>
-      <div class="scan-title">Connecting to Airspace</div>
-      <div class="scan-sub">Acquiring OpenSky Network radar telemetry...</div>
+      <div class="scan-title">Establishing ADS-B Stream</div>
+      <div class="scan-sub">Connecting to Richmond airspace receiver network...</div>
     </div>
   </div>
 
@@ -252,12 +252,16 @@
 </div>
 
 <script>
-  // Richmond corridor bounding box (Steveston to Fraser North Arm; Strait of Georgia to Hwy 91)
-  const LAMIN = 49.1100;
-  const LAMAX = 49.2300;
-  const LOMIN = -123.2800;
-  const LOMAX = -123.0200;
-  const ALT_CEILING_FT = 5000;
+  const LAT = 49.1700;
+  const LON = -123.1350;
+  const RADIUS = 8;         // Nautical miles
+  const ALT_CEILING = 5000;   // Altitude ceiling in feet
+
+  // Approximate magnetic headings of YVR's south runway (08R/26L), used
+  // only to label which runway an aircraft is lined up with.
+  const RWY_08R_HEADING = 80;
+  const RWY_26L_HEADING = 260;
+  const RWY_HEADING_TOLERANCE = 35; // degrees either side counts as "lined up"
 
   const AIRLINE_REGISTRY = {
     ACA: { name: "Air Canada", iata: "AC" },
@@ -296,68 +300,126 @@
 
   const photoStore = new Map();
   const routeStore = new Map();
+  let consecutiveFailures = 0;
+
+  // Helper with a timeout, implemented without AbortController/AbortSignal —
+  // some sandboxed preview environments relay fetch() through postMessage
+  // to a parent frame, and AbortSignal can't survive that hand-off.
+  function fetchWithTimeout(url, timeoutMs = 3500) {
+    const fetchPromise = fetch(url).then(res => {
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    });
+    const timeoutPromise = new Promise((_, reject) => {
+      setTimeout(() => reject(new Error("Request timed out")), timeoutMs);
+    });
+    return Promise.race([fetchPromise, timeoutPromise]);
+  }
+
+  // Some public ADS-B feeds don't send the Access-Control-Allow-Origin
+  // header browsers require for cross-site requests (they're mainly meant
+  // for curl/server use). When the direct call fails, retry once through a
+  // public CORS proxy that adds the missing header on the way back.
+  async function fetchDirectOrProxied(url, timeoutMs = 3500) {
+    try {
+      return await fetchWithTimeout(url, timeoutMs);
+    } catch (directErr) {
+      const proxied = `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
+      try {
+        return await fetchWithTimeout(proxied, timeoutMs);
+      } catch (proxyErr) {
+        throw directErr; // surface the original, more informative error
+      }
+    }
+  }
+
+  function isOnGround(altBaro) {
+    return typeof altBaro === "string" && altBaro.toLowerCase() === "ground";
+  }
+
+  // Great-circle distance in nautical miles between the station and an aircraft.
+  function distanceNm(lat1, lon1, lat2, lon2) {
+    const toRad = (deg) => (deg * Math.PI) / 180;
+    const R_NM = 3440.065; // Earth radius in nautical miles
+    const dLat = toRad(lat2 - lat1);
+    const dLon = toRad(lon2 - lon1);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+    return 2 * R_NM * Math.asin(Math.sqrt(a));
+  }
+
+  // Rotates across 3 community feeds
+  async function fetchRadarFeed() {
+    const providers = [
+      { name: "ADSB.one", url: `https://api.adsb.one/v2/point/${LAT}/${LON}/${RADIUS}` },
+      { name: "ADSB.lol", url: `https://api.adsb.lol/v2/point/${LAT}/${LON}/${RADIUS}` },
+      { name: "ADSB.fi", url: `https://opendata.adsb.fi/api/v2/lat/${LAT}/lon/${LON}/dist/${RADIUS}` }
+    ];
+
+    let lastError = null;
+    for (const feed of providers) {
+      try {
+        const data = await fetchDirectOrProxied(feed.url, 3500);
+        document.getElementById('feed-status').textContent = `Connected: ${feed.name} · Updated ${new Date().toLocaleTimeString()}`;
+        return data;
+      } catch (err) {
+        lastError = err;
+      }
+    }
+    throw new Error(lastError ? lastError.message : "All radar feeds timed out");
+  }
 
   async function pollAirspace() {
+    // Clock updates on every cycle
     document.getElementById('clock').textContent = new Date().toLocaleTimeString();
 
     try {
-      const url = `https://opensky-network.org/api/states/all?lamin=${LAMIN}&lomin=${LOMIN}&lamax=${LAMAX}&lomax=${LOMAX}`;
-      const res = await fetch(url);
-      
-      if (!res.ok) {
-        throw new Error(`OpenSky status ${res.status}`);
-      }
+      const data = await fetchRadarFeed();
+      consecutiveFailures = 0;
 
-      const data = await res.json();
-      document.getElementById('feed-status').textContent = `Connected: OpenSky Network · Updated ${new Date().toLocaleTimeString()}`;
-
-      if (!data.states || data.states.length === 0) {
-        renderClearState("Corridor Clear", "No aircraft detected in Richmond corridor.");
+      if (!data.ac || data.ac.length === 0) {
+        renderClearState("Corridor Clear", "No aircraft detected within 8 nautical miles.");
         return;
       }
 
-      // Parse OpenSky array format:
-      // [0] icao24, [1] callsign, [5] lon, [6] lat, [7] baro_alt (m), [8] on_ground, [9] velocity (m/s), [10] true_track, [11] vertical_rate (m/s)
-      const planes = data.states.map(s => {
-        const altM = s[7];
-        const altFt = altM !== null ? Math.round(altM * 3.28084) : (s[8] ? 0 : null);
-        const vRateMps = s[11] || 0;
-        const vRateFpm = Math.round(vRateMps * 196.85);
-        const gsKts = s[9] !== null ? Math.round(s[9] * 1.94384) : null;
-        const track = s[10] !== null ? Math.round(s[10]) : null;
-
-        return {
-          hex: s[0],
-          callsign: (s[1] || "").trim(),
-          alt_ft: altFt,
-          on_ground: s[8],
-          vertical_rate_fpm: vRateFpm,
-          gs_kts: gsKts,
-          track: track
-        };
-      });
-
-      // Filter traffic below altitude ceiling (or on ground)
-      const activePlanes = planes.filter(p => {
-        if (p.on_ground) return true;
-        return p.alt_ft !== null && p.alt_ft <= ALT_CEILING_FT;
+      // Filter traffic below altitude ceiling or on ground
+      const activePlanes = data.ac.filter(p => {
+        if (!p.alt_baro && p.alt_baro !== 0) return false;
+        if (isOnGround(p.alt_baro)) return true;
+        return typeof p.alt_baro === "number" && p.alt_baro <= ALT_CEILING;
       });
 
       if (activePlanes.length === 0) {
-        renderClearState("Corridor Clear", `All nearby aircraft are above ${ALT_CEILING_FT.toLocaleString()} ft.`);
+        renderClearState("Corridor Clear", `All aircraft in the area are above ${ALT_CEILING.toLocaleString()} ft.`);
         return;
       }
 
-      // Prioritize the lowest aircraft
-      const target = activePlanes.sort((a, b) => (a.alt_ft || 0) - (b.alt_ft || 0))[0];
+      // Tag each candidate with its distance from the station, then target
+      // whichever aircraft is physically closest to the field — this is a
+      // better proxy for "the one worth looking at" than altitude alone,
+      // since a close-in aircraft on approach can be at a similar altitude
+      // to one still several miles out.
+      const withDistance = activePlanes.map(p => ({
+        plane: p,
+        distNm: (typeof p.lat === "number" && typeof p.lon === "number")
+          ? distanceNm(LAT, LON, p.lat, p.lon)
+          : Infinity
+      }));
 
-      const [photoData, route] = await Promise.all([
-        fetchPhoto(target.hex),
-        fetchRoute(target.callsign)
+      withDistance.sort((a, b) => a.distNm - b.distNm);
+      const { plane, distNm } = withDistance[0];
+
+      const callsign = (plane.flight || plane.r || "").trim();
+
+      const [photo, route] = await Promise.all([
+        fetchPhoto(plane.hex),
+        fetchRoute(callsign)
       ]);
 
-      renderDisplay(target, photoData, route);
+      renderDisplay(plane, photo, route, distNm);
     } catch (err) {
+      consecutiveFailures++;
       document.getElementById('feed-status').textContent = `Reconnecting radar stream... (${err.message})`;
     }
   }
@@ -367,20 +429,17 @@
     if (routeStore.has(callsign)) return routeStore.get(callsign);
 
     try {
-      const res = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.response?.flightroute) {
-          const fr = data.response.flightroute;
-          const routeData = {
-            originCode: fr.origin?.iata_code || fr.origin?.icao_code || "DEP",
-            originCity: fr.origin?.municipality || fr.origin?.name || "Origin",
-            destCode: fr.destination?.iata_code || fr.destination?.icao_code || "ARR",
-            destCity: fr.destination?.municipality || fr.destination?.name || "Destination"
-          };
-          routeStore.set(callsign, routeData);
-          return routeData;
-        }
+      const data = await fetchDirectOrProxied(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`, 2000);
+      if (data?.response?.flightroute) {
+        const fr = data.response.flightroute;
+        const routeData = {
+          originCode: fr.origin?.iata_code || fr.origin?.icao_code || "DEP",
+          originCity: fr.origin?.municipality || fr.origin?.name || "Origin",
+          destCode: fr.destination?.iata_code || fr.destination?.icao_code || "ARR",
+          destCity: fr.destination?.municipality || fr.destination?.name || "Destination"
+        };
+        routeStore.set(callsign, routeData);
+        return routeData;
       }
     } catch (e) {}
 
@@ -393,18 +452,11 @@
     if (photoStore.has(hex)) return photoStore.get(hex);
 
     try {
-      const res = await fetch(`https://api.planespotters.net/pub/photos/hex/${hex}`);
-      if (res.ok) {
-        const json = await res.json();
-        if (json.photos && json.photos.length > 0) {
-          const item = json.photos[0];
-          const result = {
-            url: item.thumbnail_large ? item.thumbnail_large.src : null,
-            model: item.airplane ? item.airplane.model : (item.aircraft_type || null)
-          };
-          photoStore.set(hex, result);
-          return result;
-        }
+      const json = await fetchDirectOrProxied(`https://api.planespotters.net/pub/photos/hex/${hex}`, 2000);
+      if (json.photos && json.photos.length > 0) {
+        const url = json.photos[0].thumbnail_large.src;
+        photoStore.set(hex, url);
+        return url;
       }
     } catch (e) {}
     return null;
@@ -420,12 +472,25 @@
     `;
   }
 
-  function renderDisplay(plane, photoData, route) {
-    const rawCallsign = plane.callsign || plane.hex.toUpperCase();
+  // Angular difference between two compass headings, 0-180.
+  function headingDiff(a, b) {
+    const d = Math.abs(a - b) % 360;
+    return d > 180 ? 360 - d : d;
+  }
+
+  function runwayVectorLabel(track) {
+    if (typeof track !== "number") return "—";
+    if (headingDiff(track, RWY_08R_HEADING) <= RWY_HEADING_TOLERANCE) return "08R Vector";
+    if (headingDiff(track, RWY_26L_HEADING) <= RWY_HEADING_TOLERANCE) return "26L Vector";
+    return "Off-Axis";
+  }
+
+  function renderDisplay(plane, photoUrl, route, distNm) {
+    const rawCallsign = (plane.flight || plane.r || "UNIDENTIFIED").trim();
     const icaoPrefix = rawCallsign.slice(0, 3).toUpperCase();
     const carrier = AIRLINE_REGISTRY[icaoPrefix] || { name: "General / Private", iata: null };
 
-    const vRate = plane.vertical_rate_fpm || 0;
+    const vRate = plane.baro_rate || 0;
     let stateClass = "state-level";
     let stateLabel = "✈️ LEVEL / EN ROUTE";
     let stateRate = `${Math.abs(vRate)} ft/min`;
@@ -469,15 +534,15 @@
          </div>`
       : ``;
 
-    const photoHtml = (photoData && photoData.url)
-      ? `<img src="${photoData.url}" alt="${rawCallsign}">`
-      : `<div style="color:var(--muted)">No photograph on file for ${plane.hex.toUpperCase()}</div>`;
+    const photoHtml = photoUrl
+      ? `<img src="${photoUrl}" alt="${rawCallsign}">`
+      : `<div style="color:var(--muted)">No photograph on file for ${plane.r || plane.hex}</div>`;
 
-    const aircraftModel = (photoData && photoData.model) ? photoData.model : "Aircraft";
+    const altDisplay = isOnGround(plane.alt_baro)
+      ? "Tarmac / Ground"
+      : (typeof plane.alt_baro === "number" ? `${plane.alt_baro.toLocaleString()} ft` : "—");
 
-    const altDisplay = plane.on_ground 
-      ? "Tarmac / Ground" 
-      : `${plane.alt_ft.toLocaleString()} ft`;
+    const distDisplay = Number.isFinite(distNm) ? `${distNm.toFixed(1)} nm` : "—";
 
     document.getElementById('flight-card').innerHTML = `
       <div class="state-banner ${stateClass}">
@@ -512,7 +577,7 @@
       <div class="telemetry-grid">
         <div class="data-cell">
           <span class="data-label">Aircraft Type</span>
-          <span class="data-val">${aircraftModel}</span>
+          <span class="data-val">${plane.t || "—"}</span>
         </div>
         <div class="data-cell">
           <span class="data-label">Altitude</span>
@@ -520,28 +585,37 @@
         </div>
         <div class="data-cell">
           <span class="data-label">Ground Speed</span>
-          <span class="data-val">${plane.gs_kts ? plane.gs_kts + " kts" : "—"}</span>
+          <span class="data-val">${plane.gs ? Math.round(plane.gs) + " kts" : "—"}</span>
         </div>
         <div class="data-cell">
-          <span class="data-label">ICAO Hex</span>
-          <span class="data-val">${plane.hex.toUpperCase()}</span>
+          <span class="data-label">Distance</span>
+          <span class="data-val">${distDisplay}</span>
+        </div>
+        <div class="data-cell">
+          <span class="data-label">Registration</span>
+          <span class="data-val">${plane.r || plane.hex}</span>
         </div>
         <div class="data-cell">
           <span class="data-label">Track / Heading</span>
-          <span class="data-val">${plane.track ? plane.track + "°" : "—"}</span>
+          <span class="data-val">${plane.track ? Math.round(plane.track) + "°" : "—"}</span>
         </div>
-        <div class="data-cell">
+        <div class="data-cell" style="grid-column: span 3;">
           <span class="data-label">Runway Vector</span>
-          <span class="data-val">${(plane.track && plane.track > 180) ? "08R Vector" : "26L Vector"}</span>
+          <span class="data-val">${runwayVectorLabel(plane.track)}</span>
         </div>
       </div>
     `;
   }
 
-  // OpenSky anonymous rate limit is 1 request per 10s
+  // Self-scheduling loop: runs next poll only after current poll completes.
+  // Backs off after repeated failures so we don't hammer public feeds
+  // that are down or rate-limiting us.
   async function pollLoop() {
     await pollAirspace();
-    setTimeout(pollLoop, 10000);
+    const delay = consecutiveFailures > 0
+      ? Math.min(4000 * Math.pow(2, consecutiveFailures), 30000)
+      : 4000;
+    setTimeout(pollLoop, delay);
   }
 
   pollLoop();
