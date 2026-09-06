@@ -236,6 +236,13 @@
       opacity: 0.6;
       text-align: center;
     }
+    .callsign-top {
+      font-size: 1.4rem;
+      font-weight: 800;
+      letter-spacing: 0.03em;
+      text-align: center;
+      color: var(--text);
+    }
   </style>
 </head>
 <body>
@@ -246,6 +253,8 @@
     <div id="clock">--:--:--</div>
   </div>
 
+  <div class="callsign-top" id="callsign-top">—</div>
+
   <div class="card" id="flight-card">
     <div class="scan-screen">
       <div class="radar-sweep"></div>
@@ -255,13 +264,15 @@
   </div>
 
   <div class="feed-info" id="feed-status">Scanning live frequencies...</div>
-  <div class="version-tag">v1.4.0</div>
+  <div class="version-tag">v1.6.0</div>
 </div>
 
 <script>
   const LAT = 49.1700;
   const LON = -123.1350;
-  const RADIUS = 8;         // Nautical miles
+  const RADIUS = 8;         // Nautical miles — how far out we scan for traffic
+  const DISPLAY_RADIUS_NM = 4; // Only show a card once something is this close; keeps
+                                // a plane from lingering on screen as it flies away
   const ALT_CEILING = 5000;   // Altitude ceiling in feet
 
   // Approximate magnetic headings of YVR's south runway (08R/26L), used
@@ -307,6 +318,7 @@
 
   const photoStore = new Map();
   const routeStore = new Map();
+  const airportStore = new Map();
   let consecutiveFailures = 0;
 
   // Helper with a timeout, implemented without AbortController/AbortSignal —
@@ -429,6 +441,11 @@
       withDistance.sort((a, b) => a.distNm - b.distNm);
       const { plane, distNm } = withDistance[0];
 
+      if (distNm > DISPLAY_RADIUS_NM) {
+        renderClearState("Corridor Clear", `Nearest aircraft is ${distNm.toFixed(1)} nm away — outside the ${DISPLAY_RADIUS_NM} nm display range.`);
+        return;
+      }
+
       const callsign = (plane.flight || plane.r || "").trim();
 
       const [photo, route] = await Promise.all([
@@ -443,27 +460,66 @@
     }
   }
 
-  async function fetchRoute(callsign) {
-    if (!callsign) return null;
-    if (routeStore.has(callsign)) return routeStore.get(callsign);
-
+  async function fetchRouteFromAdsbdb(callsign) {
     try {
       const data = await fetchDirectOrProxied(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`, 2000);
       if (data?.response?.flightroute) {
         const fr = data.response.flightroute;
-        const routeData = {
+        return {
           originCode: fr.origin?.iata_code || fr.origin?.icao_code || "DEP",
           originCity: fr.origin?.municipality || fr.origin?.name || "Origin",
           destCode: fr.destination?.iata_code || fr.destination?.icao_code || "ARR",
           destCity: fr.destination?.municipality || fr.destination?.name || "Destination"
         };
-        routeStore.set(callsign, routeData);
-        return routeData;
       }
     } catch (e) {}
-
-    routeStore.set(callsign, null);
     return null;
+  }
+
+  async function fetchAirportInfo(icao) {
+    if (!icao) return null;
+    if (airportStore.has(icao)) return airportStore.get(icao);
+    try {
+      const data = await fetchDirectOrProxied(`https://hexdb.io/api/v1/airport/icao/${encodeURIComponent(icao)}`, 2000);
+      if (data && data.icao) {
+        airportStore.set(icao, data);
+        return data;
+      }
+    } catch (e) {}
+    airportStore.set(icao, null);
+    return null;
+  }
+
+  // hexdb.io's route database is independent of adsbdb's, so it often has
+  // a route on file when adsbdb comes up empty (and vice versa). It returns
+  // ICAO airport codes only, so we enrich with a name/IATA lookup after.
+  async function fetchRouteFromHexdb(callsign) {
+    try {
+      const data = await fetchDirectOrProxied(`https://hexdb.io/api/v1/route/icao/${encodeURIComponent(callsign)}`, 2000);
+      if (data && typeof data.route === "string" && data.route.includes("-")) {
+        const [originIcao, destIcao] = data.route.split("-").map(s => s.trim());
+        const [originInfo, destInfo] = await Promise.all([
+          fetchAirportInfo(originIcao),
+          fetchAirportInfo(destIcao)
+        ]);
+        return {
+          originCode: originInfo?.iata || originIcao || "DEP",
+          originCity: originInfo?.airport || originIcao || "Origin",
+          destCode: destInfo?.iata || destIcao || "ARR",
+          destCity: destInfo?.airport || destIcao || "Destination"
+        };
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  async function fetchRoute(callsign) {
+    if (!callsign) return null;
+    if (routeStore.has(callsign)) return routeStore.get(callsign);
+
+    const route = (await fetchRouteFromAdsbdb(callsign)) || (await fetchRouteFromHexdb(callsign));
+    routeStore.set(callsign, route);
+    return route;
   }
 
   async function fetchPhoto(hex) {
@@ -482,6 +538,7 @@
   }
 
   function renderClearState(title, subtitle) {
+    document.getElementById('callsign-top').textContent = '—';
     document.getElementById('flight-card').innerHTML = `
       <div class="scan-screen">
         <div class="radar-sweep"></div>
@@ -562,6 +619,8 @@
       : (typeof plane.alt_baro === "number" ? `${plane.alt_baro.toLocaleString()} ft` : "—");
 
     const distDisplay = Number.isFinite(distNm) ? `${distNm.toFixed(1)} nm` : "—";
+
+    document.getElementById('callsign-top').textContent = rawCallsign;
 
     document.getElementById('flight-card').innerHTML = `
       <div class="state-banner ${stateClass}">
