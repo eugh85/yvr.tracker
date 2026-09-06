@@ -185,10 +185,10 @@
       color: var(--muted);
       font-size: 1.05rem;
     }
-    .err-text {
-      color: #ef4444;
+    .err-msg {
+      color: #f87171;
       font-size: 0.85rem;
-      margin-top: 10px;
+      margin-top: 8px;
     }
   </style>
 </head>
@@ -208,7 +208,7 @@
 <script>
   const LAT = 49.1700;
   const LON = -123.1350;
-  const RADIUS = 8;         // Expanded slightly to catch early lineups
+  const RADIUS = 8;         // Nautical miles
   const ALT_CEILING = 5000;   // Feet
 
   const AIRLINE_REGISTRY = {
@@ -249,44 +249,74 @@
   const photoStore = new Map();
   const routeStore = new Map();
 
-  async function fetchWithFallback(url) {
-    // 1. Try direct fetch first
-    try {
-      const res = await fetch(url, { cache: "no-store" });
-      if (res.ok) return await res.json();
-    } catch (e) {
-      console.warn("Direct fetch blocked, trying CORS proxy fallback...", e);
+  // Multi-source & multi-proxy fetch engine
+  async function fetchRadarFeed() {
+    const endpoints = [
+      `https://api.airplanes.live/v2/point/${LAT}/${LON}/${RADIUS}`,
+      `https://opendata.adsb.fi/api/v2/lat/${LAT}/lon/${LON}/dist/${RADIUS}`
+    ];
+
+    for (const target of endpoints) {
+      // 1. Attempt direct CORS request
+      try {
+        const res = await fetch(target, { cache: "no-store" });
+        if (res.ok) return await res.json();
+      } catch (e) {}
+
+      // 2. Open-source CORS proxy (AllOrigins Raw)
+      try {
+        const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`);
+        if (res.ok) return await res.json();
+      } catch (e) {}
+
+      // 3. Fallback CORS proxy (CodeTabs)
+      try {
+        const res = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(target)}`);
+        if (res.ok) return await res.json();
+      } catch (e) {}
+
+      // 4. AllOrigins JSON fallback
+      try {
+        const res = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(target)}`);
+        if (res.ok) {
+          const wrapper = await res.json();
+          if (wrapper.contents) return JSON.parse(wrapper.contents);
+        }
+      } catch (e) {}
     }
 
-    // 2. Fallback via reliable open proxy if browser/Cloudflare blocks direct
-    const proxyUrl = `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
-    const proxyRes = await fetch(proxyUrl);
-    if (!proxyRes.ok) throw new Error(`Proxy status: ${proxyRes.status}`);
-    return await proxyRes.json();
+    throw new Error("Radar feeds currently unreachable.");
   }
 
   async function pollAirspace() {
     try {
-      const targetApi = `https://api.airplanes.live/v2/point/${LAT}/${LON}/${RADIUS}`;
-      const data = await fetchWithFallback(targetApi);
-
+      const data = await fetchRadarFeed();
       document.getElementById('clock').textContent = new Date().toLocaleTimeString();
 
       if (!data.ac || data.ac.length === 0) {
-        showEmpty("No planes currently detected in Richmond corridor");
+        showEmpty("No planes detected in Richmond corridor");
         return;
       }
 
-      // Filter to traffic under ceiling
-      const activePlanes = data.ac.filter(p => p.alt_baro && p.alt_baro <= ALT_CEILING);
+      // Filter traffic below altitude ceiling (also includes ground traffic on runway)
+      const activePlanes = data.ac.filter(p => {
+        if (!p.alt_baro && p.alt_baro !== 0) return false;
+        if (typeof p.alt_baro === "string" && p.alt_baro.toLowerCase() === "ground") return true;
+        return typeof p.alt_baro === "number" && p.alt_baro <= ALT_CEILING;
+      });
 
       if (activePlanes.length === 0) {
         showEmpty("Corridor clear below 5,000 ft");
         return;
       }
 
-      // Lowest plane is prioritized
-      const plane = activePlanes.sort((a, b) => a.alt_baro - b.alt_baro)[0];
+      // Lowest aircraft prioritized
+      const plane = activePlanes.sort((a, b) => {
+        const altA = a.alt_baro === "ground" ? 0 : Number(a.alt_baro) || 9999;
+        const altB = b.alt_baro === "ground" ? 0 : Number(b.alt_baro) || 9999;
+        return altA - altB;
+      })[0];
+
       const callsign = (plane.flight || plane.r || "").trim();
 
       const [photo, route] = await Promise.all([
@@ -298,7 +328,7 @@
     } catch (err) {
       console.error(err);
       document.getElementById('clock').textContent = "Offline";
-      showEmpty(`Unable to fetch live radar data.<div class="err-text">Error: ${err.message || err}</div>`);
+      showEmpty(`Connection paused.<div class="err-msg">${err.message}</div>`);
     }
   }
 
@@ -308,25 +338,22 @@
 
     try {
       const res = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`);
-      if (!res.ok) {
-        routeStore.set(callsign, null);
-        return null;
+      if (res.ok) {
+        const data = await res.json();
+        if (data?.response?.flightroute) {
+          const fr = data.response.flightroute;
+          const routeData = {
+            originCode: fr.origin?.iata_code || fr.origin?.icao_code || "DEP",
+            originCity: fr.origin?.municipality || fr.origin?.name || "Origin",
+            destCode: fr.destination?.iata_code || fr.destination?.icao_code || "ARR",
+            destCity: fr.destination?.municipality || fr.destination?.name || "Destination"
+          };
+          routeStore.set(callsign, routeData);
+          return routeData;
+        }
       }
-      const data = await res.json();
-      if (data?.response?.flightroute) {
-        const fr = data.response.flightroute;
-        const routeData = {
-          originCode: fr.origin?.iata_code || fr.origin?.icao_code || "DEP",
-          originCity: fr.origin?.municipality || fr.origin?.name || "Origin",
-          destCode: fr.destination?.iata_code || fr.destination?.icao_code || "ARR",
-          destCity: fr.destination?.municipality || fr.destination?.name || "Destination"
-        };
-        routeStore.set(callsign, routeData);
-        return routeData;
-      }
-    } catch (e) {
-      // route lookup failed gracefully
-    }
+    } catch (e) {}
+
     routeStore.set(callsign, null);
     return null;
   }
@@ -335,15 +362,15 @@
     if (photoStore.has(hex)) return photoStore.get(hex);
     try {
       const res = await fetch(`https://api.planespotters.net/pub/photos/hex/${hex}`);
-      const json = await res.json();
-      if (json.photos && json.photos.length > 0) {
-        const url = json.photos[0].thumbnail_large.src;
-        photoStore.set(hex, url);
-        return url;
+      if (res.ok) {
+        const json = await res.json();
+        if (json.photos && json.photos.length > 0) {
+          const url = json.photos[0].thumbnail_large.src;
+          photoStore.set(hex, url);
+          return url;
+        }
       }
-    } catch (e) {
-      // photo lookup failed gracefully
-    }
+    } catch (e) {}
     return null;
   }
 
@@ -400,6 +427,10 @@
       ? `<img src="${photoUrl}" alt="${rawCallsign}">`
       : `<div style="color:var(--muted)">No photograph on file for ${plane.r || plane.hex}</div>`;
 
+    const altDisplay = (plane.alt_baro === "ground" || plane.alt_baro === 0)
+      ? "Tarmac / Ground"
+      : `${plane.alt_baro.toLocaleString()} ft`;
+
     document.getElementById('flight-card').innerHTML = `
       <div class="state-banner ${stateClass}">
         <div>${stateLabel}</div>
@@ -437,7 +468,7 @@
         </div>
         <div class="data-cell">
           <span class="data-label">Altitude</span>
-          <span class="data-val">${plane.alt_baro.toLocaleString()} ft</span>
+          <span class="data-val">${altDisplay}</span>
         </div>
         <div class="data-cell">
           <span class="data-label">Ground Speed</span>
@@ -464,7 +495,7 @@
   }
 
   pollAirspace();
-  setInterval(pollAirspace, 4000);
+  setInterval(pollAirspace, 6000);
 </script>
 </body>
 </html>
