@@ -15,6 +15,7 @@
       --landing: #10b981;
       --landing-bg: rgba(16, 185, 129, 0.15);
       --route-bg: #1c2638;
+      --border: rgba(255,255,255,0.08);
     }
     body {
       margin: 0;
@@ -55,7 +56,7 @@
       background: var(--card-bg);
       border-radius: 18px;
       overflow: hidden;
-      border: 1px solid rgba(255,255,255,0.07);
+      border: 1px solid var(--border);
       box-shadow: 0 15px 35px rgba(0,0,0,0.5);
     }
     .state-banner {
@@ -77,7 +78,7 @@
       display: flex;
       justify-content: space-between;
       align-items: center;
-      border-bottom: 1px solid rgba(255,255,255,0.05);
+      border-bottom: 1px solid var(--border);
     }
     .airport-node {
       display: flex;
@@ -102,7 +103,6 @@
       font-size: 1.2rem;
       display: flex;
       align-items: center;
-      gap: 6px;
     }
 
     .photo-stage {
@@ -179,16 +179,56 @@
       font-size: 1.05rem;
       font-weight: 700;
     }
-    .empty-state {
-      padding: 70px 20px;
+
+    /* Idle Radar Scanning State */
+    .scan-screen {
+      padding: 50px 20px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
       text-align: center;
-      color: var(--muted);
-      font-size: 1.05rem;
+      gap: 12px;
     }
-    .err-msg {
-      color: #f87171;
+    .radar-sweep {
+      width: 70px;
+      height: 70px;
+      border: 2px solid rgba(16, 185, 129, 0.4);
+      border-radius: 50%;
+      position: relative;
+      animation: pulse-ring 2.5s infinite ease-out;
+    }
+    .radar-sweep::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 10px;
+      height: 10px;
+      background: #10b981;
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+    }
+    @keyframes pulse-ring {
+      0% { transform: scale(0.7); opacity: 0.3; }
+      50% { transform: scale(1.1); opacity: 0.8; }
+      100% { transform: scale(0.7); opacity: 0.3; }
+    }
+    .scan-title {
+      font-size: 1.15rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .scan-sub {
       font-size: 0.85rem;
-      margin-top: 8px;
+      color: var(--muted);
+      max-width: 320px;
+      line-height: 1.4;
+    }
+    .feed-info {
+      font-size: 0.72rem;
+      color: var(--muted);
+      text-align: center;
+      margin-top: 4px;
     }
   </style>
 </head>
@@ -196,20 +236,26 @@
 
 <div class="board">
   <div class="header-bar">
-    <div><span class="radar-pulse"></span> Richmond Skywatch (08R/26L)</div>
-    <div id="clock">Connecting...</div>
+    <div><span class="radar-pulse"></span> Richmond Corridor (08R/26L)</div>
+    <div id="clock">--:--:--</div>
   </div>
 
   <div class="card" id="flight-card">
-    <div class="empty-state">Connecting to radar stream...</div>
+    <div class="scan-screen">
+      <div class="radar-sweep"></div>
+      <div class="scan-title">Establishing ADS-B Stream</div>
+      <div class="scan-sub">Connecting to Richmond airspace receiver network...</div>
+    </div>
   </div>
+
+  <div class="feed-info" id="feed-status">Scanning live frequencies...</div>
 </div>
 
 <script>
   const LAT = 49.1700;
   const LON = -123.1350;
   const RADIUS = 8;         // Nautical miles
-  const ALT_CEILING = 5000;   // Feet
+  const ALT_CEILING = 5000;   // Altitude ceiling in feet
 
   const AIRLINE_REGISTRY = {
     ACA: { name: "Air Canada", iata: "AC" },
@@ -249,56 +295,55 @@
   const photoStore = new Map();
   const routeStore = new Map();
 
-  // Multi-source & multi-proxy fetch engine
+  // Helper with strict timeout to prevent any hanging in mobile Safari
+  async function fetchWithTimeout(url, timeoutMs = 3500) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.json();
+    } catch (err) {
+      clearTimeout(timer);
+      throw err;
+    }
+  }
+
+  // Rotates across 3 community feeds
   async function fetchRadarFeed() {
-    const endpoints = [
-      `https://api.airplanes.live/v2/point/${LAT}/${LON}/${RADIUS}`,
-      `https://opendata.adsb.fi/api/v2/lat/${LAT}/lon/${LON}/dist/${RADIUS}`
+    const providers = [
+      { name: "Airplanes.live", url: `https://api.airplanes.live/v2/point/${LAT}/${LON}/${RADIUS}` },
+      { name: "ADSB.lol", url: `https://api.adsb.lol/v2/point/${LAT}/${LON}/${RADIUS}` },
+      { name: "ADSB.fi", url: `https://opendata.adsb.fi/api/v2/lat/${LAT}/lon/${LON}/dist/${RADIUS}` }
     ];
 
-    for (const target of endpoints) {
-      // 1. Attempt direct CORS request
+    let lastError = null;
+    for (const feed of providers) {
       try {
-        const res = await fetch(target, { cache: "no-store" });
-        if (res.ok) return await res.json();
-      } catch (e) {}
-
-      // 2. Open-source CORS proxy (AllOrigins Raw)
-      try {
-        const res = await fetch(`https://api.allorigins.win/raw?url=${encodeURIComponent(target)}`);
-        if (res.ok) return await res.json();
-      } catch (e) {}
-
-      // 3. Fallback CORS proxy (CodeTabs)
-      try {
-        const res = await fetch(`https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(target)}`);
-        if (res.ok) return await res.json();
-      } catch (e) {}
-
-      // 4. AllOrigins JSON fallback
-      try {
-        const res = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(target)}`);
-        if (res.ok) {
-          const wrapper = await res.json();
-          if (wrapper.contents) return JSON.parse(wrapper.contents);
-        }
-      } catch (e) {}
+        const data = await fetchWithTimeout(feed.url, 3500);
+        document.getElementById('feed-status').textContent = `Connected: ${feed.name} · Updated ${new Date().toLocaleTimeString()}`;
+        return data;
+      } catch (err) {
+        lastError = err;
+      }
     }
-
-    throw new Error("Radar feeds currently unreachable.");
+    throw new Error(lastError ? lastError.message : "All radar feeds timed out");
   }
 
   async function pollAirspace() {
+    // Clock updates on every cycle
+    document.getElementById('clock').textContent = new Date().toLocaleTimeString();
+
     try {
       const data = await fetchRadarFeed();
-      document.getElementById('clock').textContent = new Date().toLocaleTimeString();
 
       if (!data.ac || data.ac.length === 0) {
-        showEmpty("No planes detected in Richmond corridor");
+        renderClearState("Corridor Clear", "No aircraft detected within 8 nautical miles.");
         return;
       }
 
-      // Filter traffic below altitude ceiling (also includes ground traffic on runway)
+      // Filter traffic below altitude ceiling or on ground
       const activePlanes = data.ac.filter(p => {
         if (!p.alt_baro && p.alt_baro !== 0) return false;
         if (typeof p.alt_baro === "string" && p.alt_baro.toLowerCase() === "ground") return true;
@@ -306,11 +351,11 @@
       });
 
       if (activePlanes.length === 0) {
-        showEmpty("Corridor clear below 5,000 ft");
+        renderClearState("Corridor Clear", `All aircraft in the area are above ${ALT_CEILING.toLocaleString()} ft.`);
         return;
       }
 
-      // Lowest aircraft prioritized
+      // Target lowest/closest aircraft
       const plane = activePlanes.sort((a, b) => {
         const altA = a.alt_baro === "ground" ? 0 : Number(a.alt_baro) || 9999;
         const altB = b.alt_baro === "ground" ? 0 : Number(b.alt_baro) || 9999;
@@ -326,9 +371,7 @@
 
       renderDisplay(plane, photo, route);
     } catch (err) {
-      console.error(err);
-      document.getElementById('clock').textContent = "Offline";
-      showEmpty(`Connection paused.<div class="err-msg">${err.message}</div>`);
+      document.getElementById('feed-status').textContent = `Reconnecting radar stream... (${err.message})`;
     }
   }
 
@@ -337,20 +380,17 @@
     if (routeStore.has(callsign)) return routeStore.get(callsign);
 
     try {
-      const res = await fetch(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`);
-      if (res.ok) {
-        const data = await res.json();
-        if (data?.response?.flightroute) {
-          const fr = data.response.flightroute;
-          const routeData = {
-            originCode: fr.origin?.iata_code || fr.origin?.icao_code || "DEP",
-            originCity: fr.origin?.municipality || fr.origin?.name || "Origin",
-            destCode: fr.destination?.iata_code || fr.destination?.icao_code || "ARR",
-            destCity: fr.destination?.municipality || fr.destination?.name || "Destination"
-          };
-          routeStore.set(callsign, routeData);
-          return routeData;
-        }
+      const data = await fetchWithTimeout(`https://api.adsbdb.com/v0/callsign/${encodeURIComponent(callsign)}`, 2000);
+      if (data?.response?.flightroute) {
+        const fr = data.response.flightroute;
+        const routeData = {
+          originCode: fr.origin?.iata_code || fr.origin?.icao_code || "DEP",
+          originCity: fr.origin?.municipality || fr.origin?.name || "Origin",
+          destCode: fr.destination?.iata_code || fr.destination?.icao_code || "ARR",
+          destCity: fr.destination?.municipality || fr.destination?.name || "Destination"
+        };
+        routeStore.set(callsign, routeData);
+        return routeData;
       }
     } catch (e) {}
 
@@ -359,19 +399,28 @@
   }
 
   async function fetchPhoto(hex) {
+    if (!hex) return null;
     if (photoStore.has(hex)) return photoStore.get(hex);
+
     try {
-      const res = await fetch(`https://api.planespotters.net/pub/photos/hex/${hex}`);
-      if (res.ok) {
-        const json = await res.json();
-        if (json.photos && json.photos.length > 0) {
-          const url = json.photos[0].thumbnail_large.src;
-          photoStore.set(hex, url);
-          return url;
-        }
+      const json = await fetchWithTimeout(`https://api.planespotters.net/pub/photos/hex/${hex}`, 2000);
+      if (json.photos && json.photos.length > 0) {
+        const url = json.photos[0].thumbnail_large.src;
+        photoStore.set(hex, url);
+        return url;
       }
     } catch (e) {}
     return null;
+  }
+
+  function renderClearState(title, subtitle) {
+    document.getElementById('flight-card').innerHTML = `
+      <div class="scan-screen">
+        <div class="radar-sweep"></div>
+        <div class="scan-title">${title}</div>
+        <div class="scan-sub">${subtitle}</div>
+      </div>
+    `;
   }
 
   function renderDisplay(plane, photoUrl, route) {
@@ -442,7 +491,7 @@
           <span class="airport-code">${originCode}</span>
           <span class="airport-city">${originCity}</span>
         </div>
-        <div class="route-arrow">✈ ➔</div>
+        <div class="route-arrow">➔</div>
         <div class="airport-node right">
           <span class="airport-code">${destCode}</span>
           <span class="airport-city">${destCity}</span>
@@ -490,12 +539,13 @@
     `;
   }
 
-  function showEmpty(msg) {
-    document.getElementById('flight-card').innerHTML = `<div class="empty-state">${msg}</div>`;
+  // Self-scheduling loop: runs next poll only after current poll completes
+  async function pollLoop() {
+    await pollAirspace();
+    setTimeout(pollLoop, 4000);
   }
 
-  pollAirspace();
-  setInterval(pollAirspace, 6000);
+  pollLoop();
 </script>
 </body>
 </html>
