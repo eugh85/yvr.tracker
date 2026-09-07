@@ -249,7 +249,7 @@
 
 <div class="board">
   <div class="header-bar">
-    <div><span class="radar-pulse"></span> Richmond Corridor (08R/26L)</div>
+    <div><span class="radar-pulse"></span> YVR South Runway (08R/26L)</div>
     <div id="clock">--:--:--</div>
   </div>
 
@@ -259,20 +259,21 @@
     <div class="scan-screen">
       <div class="radar-sweep"></div>
       <div class="scan-title">Establishing ADS-B Stream</div>
-      <div class="scan-sub">Connecting to Richmond airspace receiver network...</div>
+      <div class="scan-sub">Connecting to YVR south runway receiver network...</div>
     </div>
   </div>
 
   <div class="feed-info" id="feed-status">Scanning live frequencies...</div>
-  <div class="version-tag">v1.6.0</div>
+  <div class="version-tag">v1.7.0</div>
 </div>
 
 <script>
-  const LAT = 49.1700;
-  const LON = -123.1350;
+  const LAT = 49.1779587;  // Reference point: Walmart Supercentre, Alderbridge Wy (near home, public landmark)
+  const LON = -123.1203521;
   const RADIUS = 8;         // Nautical miles — how far out we scan for traffic
-  const DISPLAY_RADIUS_NM = 4; // Only show a card once something is this close; keeps
-                                // a plane from lingering on screen as it flies away
+  const DISPLAY_RADIUS_NM = 0.5; // Only show a card once something is essentially
+                                  // overhead. This is the number to nudge if it
+                                  // feels too twitchy or too loose.
   const ALT_CEILING = 5000;   // Altitude ceiling in feet
 
   // Approximate magnetic headings of YVR's south runway (08R/26L), used
@@ -414,15 +415,21 @@
         return;
       }
 
-      // Filter traffic below altitude ceiling or on ground
+      // Filter traffic below altitude ceiling, excluding ground traffic, and
+      // restricted to aircraft actually aligned with the south runway
+      // (08R/26L) — this is a south-runway-only monitor, not a catch-all
+      // for anything flying nearby.
       const activePlanes = data.ac.filter(p => {
         if (!p.alt_baro && p.alt_baro !== 0) return false;
-        if (isOnGround(p.alt_baro)) return true;
-        return typeof p.alt_baro === "number" && p.alt_baro <= ALT_CEILING;
+        if (isOnGround(p.alt_baro)) return false;
+        if (typeof p.alt_baro !== "number" || p.alt_baro > ALT_CEILING) return false;
+        if (typeof p.track !== "number") return false;
+        return headingDiff(p.track, RWY_08R_HEADING) <= RWY_HEADING_TOLERANCE ||
+               headingDiff(p.track, RWY_26L_HEADING) <= RWY_HEADING_TOLERANCE;
       });
 
       if (activePlanes.length === 0) {
-        renderClearState("Corridor Clear", `All aircraft in the area are above ${ALT_CEILING.toLocaleString()} ft.`);
+        renderClearState("Corridor Clear", "No aircraft currently lined up with the south runway within range.");
         return;
       }
 
